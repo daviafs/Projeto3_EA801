@@ -113,10 +113,32 @@ Ventoinhas
 - Potência: 2,16 W
 - Função: Uma ventoinha foi usada para controle de temperatura (ventilação) e outra para controle de umidade (exaustão)
 
-Conversor AC-DC:
-- Modelo: ADP-30BW K
+Fonte Chaveada:
+- Modelo: DF-60-12 12V5A
 - Tensão de Entrada: 100-240 VAC (60Hz)
-- Corrente de Entrada: 1 A (Alternada)
 - Tensão de Saída: 12 VDC
-- Corrente de Saída: 2,5 A (Contínua)
+- Corrente de Saída: 5 A (Contínua)
 - Função: Alimentação das ventoinhas
+
+Conversor DC-DC:
+- Módulo conversor Buck-boost
+- Modelo: XL6009
+- Potência: 20W 
+- Tensão de Entrada 5-32V (4A), 
+- Tensão de Saída: 1,25-35V (1,5A)
+
+Potênciômetro deslizante:
+- Módulo potenciômetro deslizante
+- Tensão: 3.3V a 5V DC;
+- Saída: Analógica (Dupla);
+- Resistência: 10K;
+
+Módulo Wi-Fi:
+- Módulo ESP8266 WiFi Serial
+- Chip Principal: ESP8266 Espressif;
+- Tensão de alimentação: 3.3V;
+- Potência de saída: +20dBm no modo 802.11b;
+- Alcance: ~90 metros;
+- Taxa de dados: 250kbps a 2mbit;
+- Suporte à redes: 802.11 b/g/n;
+- Consumo em Standby: <1.0mW;
