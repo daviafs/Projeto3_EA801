@@ -6,7 +6,7 @@ Desenvolvido por: Davi A. F. de Souza & Gabriel M. de Andrade
 
 Docente responsável: Antônio A. F. Quevedo
 
-Data: 11 de Maio, 2025
+Data: 11 de Julho, 2025
 
 ## Descrição:
 Título: SISTEMA DE CONTROLE PWM PARA ILUMINAÇÃO LED E CLIMATIZAÇÃO EM AGRICULTURA INDOOR
@@ -63,14 +63,18 @@ Controle remoto (não implementado no final):
 - Checa se houve envio de um comando via wifi e o executa
 - Envia dados de operação (velocidade da ventoinha, temperatura,etc.)
 
-## Mapeamento das portas (teste.ioc) ![MapeamentoPortas](https://github.com/user-attachments/assets/f4c24dea-967b-4e9c-9ea4-fa6a582366e7)
+## Mapeamento das portas <img width="960" height="410" alt="Diagrama de blocos (4)" src="https://github.com/user-attachments/assets/81ed69c8-49c9-4990-a160-c39a79644a83" />
 
 ## Fluxograma!<img width="966" height="1262" alt="Fluxograma_projeto3" src="https://github.com/user-attachments/assets/fb2d176c-cd97-45f8-921e-71f809b64bc9" />
 
 ## Imagens do projeto
 
-<img width="960" height="540" alt="Diagrama de blocos (3)" src="https://github.com/user-attachments/assets/a5ccad4d-8a63-4689-8a0e-d2b1fe4216a5" />
+<img width="503" height="184" alt="image" src="https://github.com/user-attachments/assets/c0d517d9-c5ad-4d8a-be13-aecb50925424" />
 
+Descrição de imagem: Diagrama a nível de dispositivo, com placa BitDogLab, unidade de controle padronizadas, e periféricos como atuadores, sensor e módulo WIFI
+
+
+<img width="960" height="540" alt="Diagrama de blocos (3)" src="https://github.com/user-attachments/assets/a5ccad4d-8a63-4689-8a0e-d2b1fe4216a5" />
 
 Descrição da imagem: Detalhamento das interfaces implementadas na unidade de controle padronizada. O sistema conta com uma alimentação de 12V para os módulos PWM, que também passa por um regulador de tensão ajustável para alimentar os demais componentes da placa. O uso de bornes foi considerado para facilitar as conexões com os periféricos do sistema, bem como viabilizar possíveis mudanças nos dispositivos devido a falhas
 
