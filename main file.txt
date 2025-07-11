@@ -1,0 +1,829 @@
+﻿/* USER CODE BEGIN Header */
+/**
+******************************************************************************
+* @file           : main.c
+* @brief          : Main program body
+******************************************************************************
+* @attention
+*
+* Copyright (c) 2025 STMicroelectronics.
+* All rights reserved.
+*
+* This software is licensed under terms that can be found in the LICENSE file
+* in the root directory of this software component.
+* If no LICENSE file comes with this software, it is provided AS-IS.
+*
+******************************************************************************
+*/
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include <string.h>
+#include "ssd1306.h"
+#include "ssd1306_fonts.h"
+#include "stdio.h"
+#include "ssd1306_conf.h"
+#include "core_cm4.h"
+#include "stm32f4xx_hal_dma.h"
+#include "ws2812_spi.h"
+/* USER CODE END Includes */
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+/* USER CODE END PTD */
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#define NUM_LEDS     25
+#define DEBOUNCE_MS  5
+/* USER CODE END PD */
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+/* USER CODE END PM */
+/* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+I2C_HandleTypeDef hi2c1;
+I2C_HandleTypeDef hi2c2;
+SPI_HandleTypeDef hspi5;
+TIM_HandleTypeDef htim2;
+TIM_HandleTypeDef htim3;
+/* USER CODE BEGIN PV */
+// buffer das últimas leituras do SHT-20
+static float sht_temp, sht_hum;
+// matriz de cores (GRB)
+static uint8_t ws2812_rgb[ NUM_LEDS ][3];
+// intensidade em % do LED “máximo” (0,25,50,75,100)
+static const uint8_t intensity_levels[5] = { 0, 10, 35, 70, 100 };
+// composições em porcentagem (GRB!)
+// White     = 40%R,30%G,30%B → {G,R,B} = {30,40,30}
+// Pink      = 55%R,0%G,45%B  → { 0,55,45}
+// Red+Green = 88%R,10%G,2%B → {10,88,2}
+// Full spec = igual para todos → {1,1,1}
+static const uint8_t compositions[4][3] = {
+{30, 40, 30},
+{ 0, 55, 45},
+{10, 88,  2},
+{ 1,  1,  1}
+};
+static uint8_t intensity_idx   = 1;  // começa em 35  %
+static uint8_t composition_idx = 1;  //
+static uint8_t btnA_pressed = 0;
+static uint8_t btnB_pressed = 0;
+static GPIO_PinState lastRawA = GPIO_PIN_RESET;
+static GPIO_PinState lastRawB = GPIO_PIN_RESET;
+static uint32_t      lastDebounceTimeA = 0;
+static uint32_t      lastDebounceTimeB = 0;
+// --- estado da UI ---
+static uint8_t display_page    = 1;        // 0 = home, 1 = debug
+static GPIO_PinState lastRawSw = GPIO_PIN_RESET;
+static uint32_t      lastDebounceTimeSw = 0;
+static uint8_t       sw_pressed  = 0;
+// --- temperatura / umidade e offsets ---
+static int8_t temp_offset  = 0;          // offset temperatura, vai de -25 a +25
+static int8_t hum_offset   = 0;          // offset umidade, vai de -50 a +50
+// --- rótulos para display_home ---
+static const char *intensity_labels[5] = {
+"Desligado", "Minimo", "Medio", "Alto", "Maximo"
+};
+static const char *composition_labels[4] = {
+"White", "Pink", "Red+Green", "Full"
+};
+/* USER CODE END PV */
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_TIM3_Init(void);
+static void MX_I2C2_Init(void);
+static void MX_SPI5_Init(void);
+static void MX_TIM2_Init(void);
+static void MX_I2C1_Init(void);
+/* USER CODE BEGIN PFP */
+static void MX_I2C1_Init(void);
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_TIM3_Init(void);
+static void MX_I2C2_Init(void);
+static void MX_SPI5_Init(void);
+static void MX_TIM2_Init(void);
+static void check_switch(void);
+static void update_offsets(void);
+static void display_home(void);
+static void update_matrix(void);
+/* USER CODE END PFP */
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+uint32_t ler_adc(uint32_t canal)
+{
+  ADC_ChannelConfTypeDef sConfig = {0};
+  sConfig.Channel = canal;
+  sConfig.Rank = 1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_15CYCLES;
+  HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+  HAL_ADC_Start(&hadc1);
+  HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY);
+  uint32_t valor = HAL_ADC_GetValue(&hadc1);
+  HAL_ADC_Stop(&hadc1);
+  return valor;
+}
+void set_fan_duty(TIM_HandleTypeDef *htim, uint32_t channel, uint8_t duty)
+{
+  if (duty > 99) duty = 99;
+  __HAL_TIM_SET_COMPARE(htim, channel, duty);
+}
+void atualizar_ventoinhas(uint8_t *duty_x, uint8_t *duty_y)
+{
+        int MARGEM = 450;
+  uint32_t adc_x = ler_adc(ADC_CHANNEL_6);  // PA6 (eixo X)
+  uint32_t adc_y = ler_adc(ADC_CHANNEL_9);  // PB1 (eixo Y)
+  // Eixo X → P
+  if (adc_x > (2048 + MARGEM) && *duty_x > 0)
+  {
+      (*duty_x)--;
+      set_fan_duty(&htim2, TIM_CHANNEL_2, *duty_x);
+      HAL_Delay(2);
+  }
+  else if (adc_x < (2048 - MARGEM) && *duty_x < 99)
+  {
+      (*duty_x)++;
+      set_fan_duty(&htim2, TIM_CHANNEL_2, *duty_x);
+      HAL_Delay(2);
+  }
+  // Eixo Y → PB4 (TIM3 CH1)
+  if (adc_y > (2048 + MARGEM) && *duty_y > 0)
+  {
+      (*duty_y)--;
+      set_fan_duty(&htim3, TIM_CHANNEL_1, *duty_y);
+      HAL_Delay(2);
+  }
+  else if (adc_y < (2048 - MARGEM) && *duty_y < 99)
+  {
+      (*duty_y)++;
+      set_fan_duty(&htim3, TIM_CHANNEL_1, *duty_y);
+      HAL_Delay(2);
+  }
+}
+static void atualizar_display_completo(uint8_t duty1,
+                                     uint8_t duty2,
+                                     uint8_t btnA,
+                                     uint8_t btnB,
+                                     uint8_t G,
+                                     uint8_t R,
+                                     uint8_t B)
+{
+  char buf[32];
+  // relê POT em PA0 para debug
+  uint32_t pot_raw = ler_adc(ADC_CHANNEL_0);
+  uint8_t  pot_pct = (uint8_t)(pot_raw * 100u / 4095u);
+  ssd1306_Fill(Black);
+  // Linha 0: V1 e V2
+  uint8_t pct1 = (duty1 * 100) / 99;
+  uint8_t pct2 = (duty2 * 100) / 99;
+  snprintf(buf, sizeof(buf), "V1:%3d%% V2:%3d%%", pct1, pct2);
+  ssd1306_SetCursor(0, 0);
+  ssd1306_WriteString(buf, Font_7x10, White);
+  // Linha 12: A/B
+  snprintf(buf, sizeof(buf), "A/B:%d/%d", btnA, btnB);
+  ssd1306_SetCursor(0, 12);
+  ssd1306_WriteString(buf, Font_7x10, White);
+  // Linha 24: GRB
+  snprintf(buf, sizeof(buf), "GRB:[%3d,%3d,%3d]", G, R, B);
+  ssd1306_SetCursor(0, 24);
+  ssd1306_WriteString(buf, Font_7x10, White);
+  // Linha 36: comp/int
+  snprintf(buf, sizeof(buf), "C:%u I:%u", composition_idx, intensity_idx);
+  ssd1306_SetCursor(0, 36);
+  ssd1306_WriteString(buf, Font_7x10, White);
+  // linha 48: mostra SHT-20
+  //snprintf(buf, sizeof(buf),
+  //         "S T:%2.1fC H:%2.1f%%",
+  //         sht_temp, sht_hum);
+  //ssd1306_SetCursor(0, 48);
+  //ssd1306_WriteString(buf, Font_7x10, White);
+  //ssd1306_UpdateScreen();
+  // linha 48: POT
+  snprintf(buf, sizeof(buf), "POT:%3d%%", pot_pct);
+  ssd1306_SetCursor(0, 48);
+  ssd1306_WriteString(buf, Font_7x10, White);
+  ssd1306_UpdateScreen();
+}
+static void check_buttons(void)
+{
+  uint32_t now = HAL_GetTick();
+  // --- BOTÃO A ---
+  GPIO_PinState rawA = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_12);
+  if (rawA != lastRawA) {
+      lastDebounceTimeA = now;
+      lastRawA = rawA;
+  }
+  if ((now - lastDebounceTimeA) > DEBOUNCE_MS) {
+      if (rawA == GPIO_PIN_RESET && !btnA_pressed) {
+          btnA_pressed = 1;
+          intensity_idx = (intensity_idx + 1) % 5;
+          update_matrix();
+      } else if (rawA == GPIO_PIN_SET) {
+          btnA_pressed = 0;
+      }
+  }
+  // --- BOTÃO B ---
+  GPIO_PinState rawB = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_15);
+  if (rawB != lastRawB) {
+      lastDebounceTimeB = now;
+      lastRawB = rawB;
+  }
+  if ((now - lastDebounceTimeB) > DEBOUNCE_MS) {
+      if (rawB == GPIO_PIN_RESET && !btnB_pressed) {
+          btnB_pressed = 1;
+          composition_idx = (composition_idx + 1) % 4;
+          update_matrix();
+      } else if (rawB == GPIO_PIN_SET) {
+          btnB_pressed = 0;
+      }
+  }
+}
+static void update_matrix(void)
+{
+  // 1) RESET + cálculo da cor (já existente)
+  ws2812_init();
+  uint32_t pot_raw = ler_adc(ADC_CHANNEL_0);
+  uint8_t  pot_pct = (uint8_t)(pot_raw * 100u / 4095u);
+  uint8_t I = ((pot_pct* 255 + 50) / 100)+((intensity_levels[intensity_idx] * 255 + 50) / 100);
+  if(I>255){I=255;}
+  const uint8_t *comp = compositions[composition_idx];
+  uint8_t max_pct = comp[0];
+  if (comp[1] > max_pct) max_pct = comp[1];
+  if (comp[2] > max_pct) max_pct = comp[2];
+  //uint8_t G = (uint32_t)comp[0] * I * pot_pct/ max_pct;
+  //uint8_t R = (uint32_t)comp[1] * I * pot_pct/ max_pct;
+  //uint8_t B = (uint32_t)comp[2] * I * pot_pct/ max_pct;
+  uint8_t R = (uint32_t)comp[1] * I/ max_pct;
+  uint8_t B = (uint32_t)comp[2] * I/ max_pct;
+  uint8_t G = (uint32_t)comp[0] * I/ max_pct;
+  // 2) **Atualiza o array para o display**
+  for (int i = 0; i < NUM_LEDS; i++) {
+      ws2812_rgb[i][0] = G;
+      ws2812_rgb[i][1] = R;
+      ws2812_rgb[i][2] = B;
+  }
+  // 3) Escreve e envia via SPI
+  ws2812_pixel_all(R, G, B);
+  ws2812_send_spi();
+}
+// debouncing do switch PA3 e troca de página
+static void check_switch(void)
+{
+  uint32_t now = HAL_GetTick();
+  GPIO_PinState raw = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_3);
+  if (raw != lastRawSw) {
+      lastDebounceTimeSw = now;
+      lastRawSw = raw;
+  }
+  if ((now - lastDebounceTimeSw) > DEBOUNCE_MS) {
+      if (raw == GPIO_PIN_RESET && !sw_pressed) {
+          sw_pressed = 1;
+          display_page = 1 - display_page;
+      } else if (raw == GPIO_PIN_SET) {
+          sw_pressed = 0;
+      }
+  }
+}
+// ajusta os offsets de temperatura e umidade com base no tilt do joystick
+static void update_offsets(void)
+{
+  const int MID      = 2048;
+  const int DEADZONE = 300;
+  // — TEMPERATURA (eixo Y em ADC_CHANNEL_9) —
+  uint32_t ay = ler_adc(ADC_CHANNEL_9);
+  if (ay > (MID + DEADZONE) && temp_offset > -25) {
+      temp_offset--;
+  } else if (ay < (MID - DEADZONE) && temp_offset < +25) {
+      temp_offset++;
+  }
+  if (temp_offset < -25) temp_offset = -25;
+  if (temp_offset > +25) temp_offset = +25;
+  // 1) TEMPERATURA: leitura_sensor + offset, clamp 15–40°C → ventoinha Y
+  float temp_meas = sht_temp + temp_offset;
+  if (temp_meas < 15.0f) temp_meas = 15.0f;
+  if (temp_meas > 40.0f) temp_meas = 40.0f;
+  // mapeia [15..40] → [0..100]
+  uint8_t duty_temp = (uint8_t)((temp_meas - 15.0f) * 100.0f / 25.0f);
+  set_fan_duty(&htim3, TIM_CHANNEL_1, duty_temp);
+  // — UMIDADE (eixo X em ADC_CHANNEL_6) —
+  uint32_t ax = ler_adc(ADC_CHANNEL_6);
+  if (ax > (MID + DEADZONE) && hum_offset > -50) {
+      hum_offset--;
+  } else if (ax < (MID - DEADZONE) && hum_offset < +50) {
+      hum_offset++;
+  }
+  if (hum_offset < -50) hum_offset = -50;
+  if (hum_offset > +50) hum_offset = +50;
+  // 2) UMIDADE: leitura_sensor + offset, clamp 0–100% → ventoinha X
+  float hum_meas = sht_hum + hum_offset;
+  if (hum_meas <  0.0f) hum_meas =  0.0f;
+  if (hum_meas >100.0f) hum_meas =100.0f;
+  // mapeia diretamente [0..100] → [0..100]
+  uint8_t duty_hum = (uint8_t)(hum_meas);
+  set_fan_duty(&htim2, TIM_CHANNEL_2, duty_hum);
+}
+// desenha a tela “home” com temperatura, umidade, intensidade e composição
+static void display_home(void)
+{
+  char buf[32];
+  ssd1306_Fill(Black);
+  // Temperatura: sensor + offset = final
+  float temp_final = sht_temp + temp_offset;
+  // — garante 15…40°C —
+  if (temp_final < 15.0f) temp_final = 15.0f;
+  if (temp_final > 40.0f) temp_final = 40.0f;
+  snprintf(buf, sizeof(buf),
+           "Tmp:%2.1f%+d=%2.1fC",
+           sht_temp,
+           temp_offset,
+           temp_final);
+  ssd1306_SetCursor(0,  0);
+  ssd1306_WriteString(buf, Font_7x10, White);
+  // Umidade: sensor + offset = final%
+  float hum_final = sht_hum + hum_offset;
+  // — garanta 0…100% —
+  if (hum_final <  0.0f) hum_final =  0.0f;
+  if (hum_final >100.0f) hum_final =100.0f;
+  snprintf(buf, sizeof(buf),
+           "Umd:%2.1f%+d=%2.1f%%",
+           sht_hum,
+           hum_offset,
+           hum_final);
+  ssd1306_SetCursor(0, 12);
+  ssd1306_WriteString(buf, Font_7x10, White);
+  // Intensidade da luz
+  snprintf(buf, sizeof(buf), "Intens:%s",
+           intensity_labels[intensity_idx]);
+  ssd1306_SetCursor(0, 24);
+  ssd1306_WriteString(buf, Font_7x10, White);
+  // Composição
+  snprintf(buf, sizeof(buf), "Comp:%s",
+           composition_labels[composition_idx]);
+  ssd1306_SetCursor(0, 36);
+  ssd1306_WriteString(buf, Font_7x10, White);
+  ssd1306_UpdateScreen();
+}
+static float SHT20_ReadTemperature(void)
+{
+  uint8_t cmd = 0xF3;                             // comando “no-hold” temp
+  HAL_I2C_Master_Transmit(&hi2c1, 0x40<<1, &cmd, 1, HAL_MAX_DELAY);
+  HAL_Delay(85);                                  // tempo de conversão ~85 ms
+  uint8_t data[3];
+  HAL_I2C_Master_Receive(&hi2c1, 0x40<<1, data, 3, HAL_MAX_DELAY);
+  uint16_t raw = (data[0]<<8) | data[1];
+  return -46.85f + 175.72f * raw / 65536.0f;       // fórmula do datasheet
+}
+static float SHT20_ReadHumidity(void)
+{
+  uint8_t cmd = 0xF5;                             // comando “no-hold” hum
+  HAL_I2C_Master_Transmit(&hi2c1, 0x40<<1, &cmd, 1, HAL_MAX_DELAY);
+  HAL_Delay(29);                                  // tempo de conversão ~29 ms
+  uint8_t data[3];
+  HAL_I2C_Master_Receive(&hi2c1, 0x40<<1, data, 3, HAL_MAX_DELAY);
+  uint16_t raw = (data[0]<<8) | data[1];
+  return -6.0f + 125.0f   * raw / 65536.0f;
+}
+/* USER CODE END 0 */
+/**
+ * @brief  The application entry point.
+ * @retval int
+ */
+int main(void)
+{
+ /* USER CODE BEGIN 1 */
+/* Enable DWT cycle counter for sub-µs delays */
+CoreDebug->DEMCR   |= CoreDebug_DEMCR_TRCENA_Msk;
+DWT->CTRL         |= DWT_CTRL_CYCCNTENA_Msk;
+ /* USER CODE END 1 */
+ /* MCU Configuration--------------------------------------------------------*/
+ /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+ HAL_Init();
+ /* USER CODE BEGIN Init */
+ /* USER CODE END Init */
+ /* Configure the system clock */
+ SystemClock_Config();
+ /* USER CODE BEGIN SysInit */
+ /* USER CODE END SysInit */
+ /* Initialize all configured peripherals */
+ MX_GPIO_Init();
+ MX_ADC1_Init();
+ MX_TIM3_Init();
+ MX_I2C2_Init();
+ MX_SPI5_Init();
+ MX_TIM2_Init();
+ MX_I2C1_Init();
+ /* USER CODE BEGIN 2 */
+HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);  // PB4 (ventoinha Y)
+HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);  // PB3 (ventoinha X)
+ssd1306_Init();
+ssd1306_Fill(Black);
+ssd1306_SetCursor(0,0);
+ssd1306_WriteString("I2C scan...", Font_7x10, White);
+ssd1306_UpdateScreen();
+for (uint8_t addr = 1; addr < 128; addr++) {
+    // HAL_I2C_IsDeviceReady retorna HAL_OK se houver ACK
+    if (HAL_I2C_IsDeviceReady(&hi2c1, addr<<1, 1, 10) == HAL_OK) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "0x%02X found", addr);
+        ssd1306_Fill(Black);
+        ssd1306_SetCursor(0,0);
+        ssd1306_WriteString(buf, Font_7x10, White);
+        ssd1306_UpdateScreen();
+        HAL_Delay(500);
+    }
+}
+ws2812_init();     // zera o buffer e envia reset
+update_matrix();   // pinta com cor/intensidade inicial
+// Inicialização das ventoinhas com 50% da velocidade maxima
+uint8_t duty_x = 50;
+uint8_t duty_y = 50;
+set_fan_duty(&htim2, TIM_CHANNEL_2, duty_x);
+set_fan_duty(&htim3, TIM_CHANNEL_1, duty_y); // PB4
+ /* USER CODE END 2 */
+ /* Infinite loop */
+ /* USER CODE BEGIN WHILE */
+while (1)
+{
+            // atualiza ventoinhas e leitura A/B
+            atualizar_ventoinhas(&duty_x, &duty_y);
+            check_buttons();    // A e B para cores/intensidade
+            check_switch();     // PA3 troca página
+            if (display_page == 0) {
+                update_offsets();
+                // lê o SHT-20
+                sht_temp = SHT20_ReadTemperature();
+                sht_hum  = SHT20_ReadHumidity();
+                display_home();
+            }
+            else {
+                    atualizar_ventoinhas(&duty_x, &duty_y);  // joystick só no debug
+                // debug screen continua igual
+                atualizar_display_completo(
+                    duty_x,
+                    duty_y,
+                    btnA_pressed,
+                    btnB_pressed,
+                    ws2812_rgb[0][0],
+                    ws2812_rgb[0][1],
+                    ws2812_rgb[0][2]
+                );
+            }
+            update_matrix();
+   /* USER CODE END WHILE */
+   /* USER CODE BEGIN 3 */
+}
+ /* USER CODE END 3 */
+}
+/**
+ * @brief System Clock Configuration
+ * @retval None
+ */
+void SystemClock_Config(void)
+{
+ RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+ RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+ /** Configure the main internal regulator output voltage
+ */
+ __HAL_RCC_PWR_CLK_ENABLE();
+ __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+ /** Initializes the RCC Oscillators according to the specified parameters
+ * in the RCC_OscInitTypeDef structure.
+ */
+ RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+ RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+ RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+ RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+ RCC_OscInitStruct.PLL.PLLM = 25;
+ RCC_OscInitStruct.PLL.PLLN = 192;
+ RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+ RCC_OscInitStruct.PLL.PLLQ = 4;
+ if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+ {
+   Error_Handler();
+ }
+ /** Initializes the CPU, AHB and APB buses clocks
+ */
+ RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                             |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+ RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+ RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV2;
+ RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+ RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+ if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
+ {
+   Error_Handler();
+ }
+}
+/**
+ * @brief ADC1 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_ADC1_Init(void)
+{
+ /* USER CODE BEGIN ADC1_Init 0 */
+ /* USER CODE END ADC1_Init 0 */
+ ADC_ChannelConfTypeDef sConfig = {0};
+ /* USER CODE BEGIN ADC1_Init 1 */
+ /* USER CODE END ADC1_Init 1 */
+ /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
+ */
+ hadc1.Instance = ADC1;
+ hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV2;
+ hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+ hadc1.Init.ScanConvMode = DISABLE;
+ hadc1.Init.ContinuousConvMode = DISABLE;
+ hadc1.Init.DiscontinuousConvMode = DISABLE;
+ hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+ hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+ hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+ hadc1.Init.NbrOfConversion = 1;
+ hadc1.Init.DMAContinuousRequests = DISABLE;
+ hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+ if (HAL_ADC_Init(&hadc1) != HAL_OK)
+ {
+   Error_Handler();
+ }
+ /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+ */
+ sConfig.Channel = ADC_CHANNEL_9;
+ sConfig.Rank = 1;
+ sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
+ if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+ {
+   Error_Handler();
+ }
+ /* USER CODE BEGIN ADC1_Init 2 */
+ /* USER CODE END ADC1_Init 2 */
+}
+/**
+ * @brief I2C1 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_I2C1_Init(void)
+{
+ /* USER CODE BEGIN I2C1_Init 0 */
+ /* USER CODE END I2C1_Init 0 */
+ /* USER CODE BEGIN I2C1_Init 1 */
+ /* USER CODE END I2C1_Init 1 */
+ hi2c1.Instance = I2C1;
+ hi2c1.Init.ClockSpeed = 100000;
+ hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+ hi2c1.Init.OwnAddress1 = 0;
+ hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+ hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+ hi2c1.Init.OwnAddress2 = 0;
+ hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+ hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+ if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+ {
+   Error_Handler();
+ }
+ /* USER CODE BEGIN I2C1_Init 2 */
+ /* USER CODE END I2C1_Init 2 */
+}
+/**
+ * @brief I2C2 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_I2C2_Init(void)
+{
+ /* USER CODE BEGIN I2C2_Init 0 */
+ /* USER CODE END I2C2_Init 0 */
+ /* USER CODE BEGIN I2C2_Init 1 */
+ /* USER CODE END I2C2_Init 1 */
+ hi2c2.Instance = I2C2;
+ hi2c2.Init.ClockSpeed = 100000;
+ hi2c2.Init.DutyCycle = I2C_DUTYCYCLE_2;
+ hi2c2.Init.OwnAddress1 = 0;
+ hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+ hi2c2.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+ hi2c2.Init.OwnAddress2 = 0;
+ hi2c2.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+ hi2c2.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+ if (HAL_I2C_Init(&hi2c2) != HAL_OK)
+ {
+   Error_Handler();
+ }
+ /* USER CODE BEGIN I2C2_Init 2 */
+ /* USER CODE END I2C2_Init 2 */
+}
+/**
+ * @brief SPI5 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_SPI5_Init(void)
+{
+ /* USER CODE BEGIN SPI5_Init 0 */
+ /* USER CODE END SPI5_Init 0 */
+ /* USER CODE BEGIN SPI5_Init 1 */
+ /* USER CODE END SPI5_Init 1 */
+ /* SPI5 parameter configuration*/
+ hspi5.Instance = SPI5;
+ hspi5.Init.Mode = SPI_MODE_MASTER;
+ hspi5.Init.Direction = SPI_DIRECTION_2LINES;
+ hspi5.Init.DataSize = SPI_DATASIZE_8BIT;
+ hspi5.Init.CLKPolarity = SPI_POLARITY_LOW;
+ hspi5.Init.CLKPhase = SPI_PHASE_1EDGE;
+ hspi5.Init.NSS = SPI_NSS_SOFT;
+ hspi5.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
+ hspi5.Init.FirstBit = SPI_FIRSTBIT_MSB;
+ hspi5.Init.TIMode = SPI_TIMODE_DISABLE;
+ hspi5.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+ hspi5.Init.CRCPolynomial = 10;
+ if (HAL_SPI_Init(&hspi5) != HAL_OK)
+ {
+   Error_Handler();
+ }
+ /* USER CODE BEGIN SPI5_Init 2 */
+ /* USER CODE END SPI5_Init 2 */
+}
+/**
+ * @brief TIM2 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_TIM2_Init(void)
+{
+ /* USER CODE BEGIN TIM2_Init 0 */
+ /* USER CODE END TIM2_Init 0 */
+ TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+ TIM_MasterConfigTypeDef sMasterConfig = {0};
+ TIM_OC_InitTypeDef sConfigOC = {0};
+ /* USER CODE BEGIN TIM2_Init 1 */
+ /* USER CODE END TIM2_Init 1 */
+ htim2.Instance = TIM2;
+ htim2.Init.Prescaler = 4799;
+ htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+ htim2.Init.Period = 99;
+ htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+ htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+ if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+ {
+   Error_Handler();
+ }
+ sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+ if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+ {
+   Error_Handler();
+ }
+ if (HAL_TIM_PWM_Init(&htim2) != HAL_OK)
+ {
+   Error_Handler();
+ }
+ sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+ sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+ if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+ {
+   Error_Handler();
+ }
+ sConfigOC.OCMode = TIM_OCMODE_PWM1;
+ sConfigOC.Pulse = 0;
+ sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+ sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+ if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+ {
+   Error_Handler();
+ }
+ /* USER CODE BEGIN TIM2_Init 2 */
+ /* USER CODE END TIM2_Init 2 */
+ HAL_TIM_MspPostInit(&htim2);
+}
+/**
+ * @brief TIM3 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_TIM3_Init(void)
+{
+ /* USER CODE BEGIN TIM3_Init 0 */
+ /* USER CODE END TIM3_Init 0 */
+ TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+ TIM_MasterConfigTypeDef sMasterConfig = {0};
+ TIM_OC_InitTypeDef sConfigOC = {0};
+ /* USER CODE BEGIN TIM3_Init 1 */
+ /* USER CODE END TIM3_Init 1 */
+ htim3.Instance = TIM3;
+ htim3.Init.Prescaler = 4799;
+ htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+ htim3.Init.Period = 99;
+ htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+ htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+ if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+ {
+   Error_Handler();
+ }
+ sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+ if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
+ {
+   Error_Handler();
+ }
+ if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
+ {
+   Error_Handler();
+ }
+ sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+ sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+ if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+ {
+   Error_Handler();
+ }
+ sConfigOC.OCMode = TIM_OCMODE_PWM1;
+ sConfigOC.Pulse = 0;
+ sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+ sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+ if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+ {
+   Error_Handler();
+ }
+ /* USER CODE BEGIN TIM3_Init 2 */
+HAL_TIM_MspPostInit(&htim3);
+ /* USER CODE END TIM3_Init 2 */
+ HAL_TIM_MspPostInit(&htim3);
+}
+/**
+ * @brief GPIO Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_GPIO_Init(void)
+{
+ GPIO_InitTypeDef GPIO_InitStruct = {0};
+ /* USER CODE BEGIN MX_GPIO_Init_1 */
+ /* USER CODE END MX_GPIO_Init_1 */
+ /* GPIO Ports Clock Enable */
+ __HAL_RCC_GPIOH_CLK_ENABLE();
+ __HAL_RCC_GPIOA_CLK_ENABLE();
+ __HAL_RCC_GPIOB_CLK_ENABLE();
+ /*Configure GPIO pin : PA3 */
+ GPIO_InitStruct.Pin = GPIO_PIN_3;
+ GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+ GPIO_InitStruct.Pull = GPIO_PULLUP;
+ HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+ /*Configure GPIO pin : PB12 */
+ GPIO_InitStruct.Pin = GPIO_PIN_12;
+ GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+ GPIO_InitStruct.Pull = GPIO_PULLUP;
+ HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+ /*Configure GPIO pin : PA15 */
+ GPIO_InitStruct.Pin = GPIO_PIN_15;
+ GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+ GPIO_InitStruct.Pull = GPIO_PULLUP;
+ HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+ /* USER CODE BEGIN MX_GPIO_Init_2 */
+// --- I2C1 GPIO Configuration (PB6=SCL, PB7=SDA) ---
+__HAL_RCC_GPIOB_CLK_ENABLE();
+GPIO_InitStruct.Pin       = GPIO_PIN_6 | GPIO_PIN_7;
+GPIO_InitStruct.Mode      = GPIO_MODE_AF_OD;
+GPIO_InitStruct.Pull      = GPIO_PULLUP;
+GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+GPIO_InitStruct.Alternate = GPIO_AF4_I2C1;
+HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+// --- POTENCIÔMETRO PA0  ---
+__HAL_RCC_GPIOC_CLK_ENABLE();
+GPIO_InitStruct.Pin  = GPIO_PIN_0;
+GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+GPIO_InitStruct.Pull = GPIO_NOPULL;
+HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+ /* USER CODE END MX_GPIO_Init_2 */
+}
+/* USER CODE BEGIN 4 */
+/* USER CODE END 4 */
+/**
+ * @brief  This function is executed in case of error occurrence.
+ * @retval None
+ */
+void Error_Handler(void)
+{
+ /* USER CODE BEGIN Error_Handler_Debug */
+/* User can add his own implementation to report the HAL error return state */
+__disable_irq();
+while (1)
+{
+}
+ /* USER CODE END Error_Handler_Debug */
+}
+#ifdef  USE_FULL_ASSERT
+/**
+ * @brief  Reports the name of the source file and the source line number
+ *         where the assert_param error has occurred.
+ * @param  file: pointer to the source file name
+ * @param  line: assert_param error line source number
+ * @retval None
+ */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+ /* USER CODE BEGIN 6 */
+/* User can add his own implementation to report the file name and line number,
+   ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+ /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
